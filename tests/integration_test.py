@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import os
+import random
 import tempfile
 import time
 
@@ -84,7 +85,7 @@ async def test_migration_read_consistency():
 
 
 async def test_replica_failover():
-    log("\n=== TEST 2: Replica Sync + Primary Failover ===")
+    log("\n=== TEST 2: Replica Sync + Primary Failover (GET path triggers fault count) ===")
     with tempfile.TemporaryDirectory() as tmpdir:
         ring = ConsistentHashRing(vnodes_per_weight=50, replication_factor=2)
         meta = MetadataStore(db_path=os.path.join(tmpdir, "db"))
@@ -112,20 +113,35 @@ async def test_replica_failover():
         ok = await nm.write_key(primary, test_key, test_value)
         assert ok, "Write failed"
 
+        pre_fault_count = 0
+        for line in metrics.get_metrics_text().splitlines():
+            if 'dcache_fault_total' in line and 'dcache_fault_total{' in line and not line.startswith("#"):
+                try:
+                    pre_fault_count += int(line.split()[-1])
+                except Exception:
+                    pass
+        log(f"  Pre-fault dcache_fault_total sum: {pre_fault_count}")
+
         ring.set_node_offline(primary)
-        await ft.handle_node_failure(primary, "simulated outage")
-
-        fault_count = metrics.get_metrics_text().count("dcache_fault_total")
-        log(f"  Fault count in metrics present: {fault_count > 0}")
-        assert fault_count > 0, "Fault not recorded"
-
-        await asyncio.sleep(0.1)
 
         new_primary = nm.get_node(test_key)
         read_result = await nm.read_key(new_primary, test_key)
-        log(f"  After {primary} down, read via {new_primary} got: {read_result}")
+        log(f"  After {primary} down (via read_key), read got: {read_result}")
         assert read_result == test_value, (
             f"After primary failover expected={test_value} got={read_result}"
+        )
+
+        post_fault_count = 0
+        for line in metrics.get_metrics_text().splitlines():
+            if 'dcache_fault_total{' in line and not line.startswith("#"):
+                try:
+                    post_fault_count += int(line.split()[-1])
+                except Exception:
+                    pass
+        log(f"  Post-fault (after GET replica takeover) dcache_fault_total sum: {post_fault_count}")
+        assert post_fault_count > pre_fault_count, (
+            f"Fault count should increase after replica takeover during GET, "
+            f"pre={pre_fault_count} post={post_fault_count}"
         )
 
         await nm.stop()
@@ -293,6 +309,195 @@ async def test_idempotency_concurrent():
     log("TEST 5 PASSED")
 
 
+async def test_http_churn_data_integrity():
+    log("\n=== TEST 6: HTTP Interface-Level Churn + PUT/GET Data Integrity ===")
+    try:
+        from aiohttp import web, ClientSession, TCPConnector
+    except ImportError:
+        log("  aiohttp not available, skipping HTTP churn test")
+        log("TEST 6 SKIPPED")
+        return
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        from dcache.main import DistributedCacheServer
+
+        server = DistributedCacheServer(
+            host="127.0.0.1", port=0,
+            db_path=os.path.join(tmpdir, "leveldb"),
+            vnodes_per_weight=50, replication_factor=2,
+            rebalance_interval=3600, skew_threshold=0.5,
+            log_level="ERROR",
+        )
+        await server.start()
+
+        actual_port = None
+        for site in getattr(server._runner, "sites", []) or []:
+            name = getattr(site, "_name", None) or ""
+            try:
+                actual_port = int(str(name).split(":")[-1])
+            except Exception:
+                pass
+        if actual_port is None or actual_port == 0:
+            runner_sites = server._runner.sites
+            if runner_sites:
+                s = runner_sites[0]
+                try:
+                    actual_port = int(str(getattr(s, "_server", s).sockets[0].getsockname()[1]))
+                except Exception:
+                    pass
+        base_url = f"http://127.0.0.1:{actual_port}"
+        log(f"  Server listening on {base_url}")
+
+        connector = TCPConnector(limit=100)
+        written_values: dict = {}
+        write_lock = asyncio.Lock()
+
+        async def do_put(session, idx):
+            key = f"churn_key_{idx}"
+            value = f"churn_value_{idx}_{int(time.time() * 1000)}"
+            try:
+                async with session.put(
+                    f"{base_url}/cache/{key}", json={"value": value},
+                ) as resp:
+                    if resp.status == 200:
+                        async with write_lock:
+                            written_values[key] = value
+                        return True
+            except Exception:
+                pass
+            return False
+
+        async def do_get(session, key, expected):
+            try:
+                async with session.get(f"{base_url}/cache/{key}") as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        got = body.get("value")
+                        if got == expected:
+                            return True
+                        return False
+                    elif resp.status == 404:
+                        return False
+            except Exception:
+                pass
+            return False
+
+        async def do_add_node(session, node_id, weight=1):
+            try:
+                async with session.post(
+                    f"{base_url}/cluster/nodes",
+                    json={"node_id": node_id, "host": "127.0.0.1", "port": 9100 + int(node_id.split("_")[-1]), "weight": weight},
+                ) as resp:
+                    return resp.status == 200
+            except Exception:
+                return False
+
+        async def do_remove_node(session, node_id):
+            try:
+                async with session.delete(f"{base_url}/cluster/nodes/{node_id}") as resp:
+                    return resp.status == 200
+            except Exception:
+                return False
+
+        async with ClientSession(connector=connector) as session:
+            for i in range(3):
+                ok = await do_add_node(session, f"seed_{i}", weight=random.choice([1, 2, 3]))
+                log(f"  Added seed_{i}: {ok}")
+
+            await asyncio.sleep(0.2)
+
+            churn_started = time.monotonic()
+            churn_duration = 3.0
+            churn_ops = 0
+            node_counter = 10
+
+            initial_writes = []
+            for i in range(200):
+                initial_writes.append(do_put(session, i))
+            await asyncio.gather(*initial_writes)
+            log(f"  Initial written keys: {len(written_values)}")
+
+            async def churn_task():
+                nonlocal churn_ops, node_counter
+                while time.monotonic() - churn_started < churn_duration:
+                    op = random.choice(["add", "remove", "add", "put"])
+                    if op == "add":
+                        nid = f"dyn_{node_counter}"
+                        node_counter += 1
+                        await do_add_node(session, nid, weight=random.choice([1, 2]))
+                        churn_ops += 1
+                    elif op == "remove":
+                        status = {}
+                        try:
+                            async with session.get(f"{base_url}/cluster/status") as resp:
+                                if resp.status == 200:
+                                    status = await resp.json()
+                        except Exception:
+                            pass
+                        nodes = [k for k in (status or {}).get("load_distribution", {}).keys()
+                                 if k.startswith("dyn_") or (k.startswith("seed_") and len((status or {}).get("load_distribution", {})) > 2)]
+                        if nodes:
+                            victim = random.choice(nodes)
+                            await do_remove_node(session, victim)
+                            churn_ops += 1
+                    else:
+                        i = random.randint(0, 999)
+                        await do_put(session, i)
+                        churn_ops += 1
+                    await asyncio.sleep(0.02)
+
+            churn_tasks = [asyncio.create_task(churn_task()) for _ in range(3)]
+
+            reads_attempted = 0
+            reads_failed = 0
+            while time.monotonic() - churn_started < churn_duration:
+                snapshot = {}
+                async with write_lock:
+                    snapshot = dict(written_values)
+                if snapshot:
+                    sample_keys = random.sample(list(snapshot.keys()), min(20, len(snapshot)))
+                    tasks = [do_get(session, k, snapshot[k]) for k in sample_keys]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for r, k in zip(results, sample_keys):
+                        reads_attempted += 1
+                        if r is not True:
+                            reads_failed += 1
+                            if reads_failed <= 5:
+                                log(f"  FAILED READ key={k} expected={snapshot[k]} result={r}")
+                await asyncio.sleep(0.05)
+
+            await asyncio.gather(*churn_tasks, return_exceptions=True)
+
+            log(f"  Churn ops performed: {churn_ops}")
+            log(f"  During-churn reads: {reads_attempted} attempted, {reads_failed} failed")
+
+            await asyncio.sleep(1.0)
+
+            final_failed = 0
+            final_attempted = 0
+            snapshot = {}
+            async with write_lock:
+                snapshot = dict(written_values)
+            keys = list(snapshot.keys())
+            batch = 50
+            for i in range(0, len(keys), batch):
+                chunk = keys[i : i + batch]
+                tasks = [do_get(session, k, snapshot[k]) for k in chunk]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    final_attempted += 1
+                    if r is not True:
+                        final_failed += 1
+
+            log(f"  After-churn reads: {final_attempted} attempted, {final_failed} failed")
+            assert final_failed == 0, (
+                f"Data loss detected after churn: {final_failed}/{final_attempted} keys missing"
+            )
+
+        await server.stop()
+        log("TEST 6 PASSED")
+
+
 async def main():
     log("=" * 60)
     log("INTEGRATION TESTS FOR BUG FIXES")
@@ -304,6 +509,7 @@ async def main():
         test_node_removal_safe_drain,
         test_hit_miss_metrics,
         test_idempotency_concurrent,
+        test_http_churn_data_integrity,
     ]
 
     passed = 0

@@ -23,14 +23,6 @@ logger = logging.getLogger(__name__)
 _MISS_SENTINEL = object()
 
 
-@dataclass
-class _IdempotentState:
-    pass
-
-
-_PENDING = _IdempotentState()
-
-
 class NodeManager:
 
     def __init__(
@@ -66,7 +58,8 @@ class NodeManager:
         self._shard_data: Dict[str, Dict[str, Any]] = defaultdict(dict)
 
         self._draining_nodes: Set[str] = set()
-        self._migration_inflight_keys: Set[str] = set()
+        self._fault_recorded: Set[str] = set()
+        self._fault_lock = asyncio.Lock()
         self._data_lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -90,7 +83,7 @@ class NodeManager:
             except asyncio.CancelledError:
                 pass
 
-        for mid, task in self._active_migrations.items():
+        for mid, task in list(self._active_migrations.items()):
             task.cancel()
             try:
                 await task
@@ -147,53 +140,33 @@ class NodeManager:
         self._draining_nodes.add(node_id)
         self._ring.set_node_offline(node_id)
 
-        migration_plans = []
-        all_nodes_info = self._ring.get_all_nodes()
-        all_node_ids = list(all_nodes_info.keys())
-        if len(all_node_ids) > 1:
-            remaining = [nid for nid in all_node_ids if nid != node_id]
-            remaining_online = [n for n in remaining if all_nodes_info[n].is_online]
-            if remaining_online:
-                source_data = list(self._shard_data.get(node_id, {}).keys())
-                total_keys = len(source_data)
-                if total_keys > 0:
-                    batch = MigrationPlan(
-                        source_node=node_id,
-                        target_node=remaining_online[0],
-                        key_ranges=[],
-                        estimated_keys=total_keys,
-                    )
-                    migration_plans.append(batch)
+        drain_migration_id = f"drain_{node_id}"
+        async with self._migration_lock:
+            if drain_migration_id not in self._active_migrations:
+                task = asyncio.create_task(self._execute_drain(node_id, drain_migration_id))
+                self._active_migrations[drain_migration_id] = task
 
-        try:
-            if migration_plans:
-                for plan in migration_plans:
-                    await self._start_migration(plan)
+        self._node_heartbeats.pop(node_id, None)
+        self._meta.delete_node_info(node_id)
+        self._persist_topology()
+        self._update_cluster_metrics()
 
-            self._node_heartbeats.pop(node_id, None)
-            self._meta.delete_node_info(node_id)
-
-            self._persist_topology()
-            self._update_cluster_metrics()
-
-            logger.info(
-                "Node %s drain started, %d migrations, API returning ok (data drain in background)",
-                node_id, len(migration_plans),
-            )
-        except Exception as e:
-            logger.error("Error during remove_node: %s", e)
-            raise
+        logger.info(
+            "Node %s drain started, API returning ok (background drain in progress)",
+            node_id,
+        )
 
         async def _finalize_removal():
             try:
                 await asyncio.sleep(0)
-                await self._wait_active_migrations_for_node(node_id)
+                await self._wait_active_migrations_for_node(node_id, drain_migration_id)
                 try:
                     self._ring.remove_node(node_id)
                 except NodeNotFoundError:
                     pass
                 self._draining_nodes.discard(node_id)
-                self._shard_data.pop(node_id, None)
+                async with self._data_lock:
+                    self._shard_data.pop(node_id, None)
                 self._persist_topology()
                 logger.info("Node %s fully removed after drain complete", node_id)
             except Exception as e:
@@ -201,16 +174,87 @@ class NodeManager:
 
         asyncio.create_task(_finalize_removal())
 
-    async def _wait_active_migrations_for_node(self, node_id: str) -> None:
-        deadline = time.monotonic() + 60.0
+    async def _execute_drain(self, source_node: str, migration_id: str) -> None:
+        async with self._migration_semaphore:
+            start_time = time.monotonic()
+            success = True
+
+            try:
+                logger.info("Drain %s: node %s -> remaining nodes started", migration_id, source_node)
+
+                async with self._data_lock:
+                    source_items = list(self._shard_data.get(source_node, {}).items())
+
+                per_target: Dict[str, List[tuple]] = defaultdict(list)
+                for key, value in source_items:
+                    target = self._ring.get_node(key)
+                    if target is None or target == source_node:
+                        remaining = [
+                            nid for nid, n in self._ring.get_online_nodes().items()
+                            if nid != source_node
+                        ]
+                        if remaining:
+                            target = remaining[0]
+                        else:
+                            continue
+                    per_target[target].append((key, value))
+
+                total_moved = 0
+                for target, items in per_target.items():
+                    batch_size = 100
+                    for i in range(0, len(items), batch_size):
+                        batch = items[i : i + batch_size]
+                        async with self._data_lock:
+                            for key, value in batch:
+                                self._shard_data[target][key] = value
+                        total_moved += len(batch)
+                        await asyncio.sleep(0)
+
+                duration = time.monotonic() - start_time
+                self._metrics.record_migration(source_node, "multi_target", duration, True)
+
+                self._meta.save_migration_state(migration_id, {
+                    "migration_id": migration_id,
+                    "source_node": source_node,
+                    "target_nodes": list(per_target.keys()),
+                    "status": "completed",
+                    "completed_at": time.time(),
+                    "moved_keys": total_moved,
+                })
+                logger.info(
+                    "Drain %s completed in %.3fs, %d keys across %d targets",
+                    migration_id, duration, total_moved, len(per_target),
+                )
+            except Exception as e:
+                success = False
+                duration = time.monotonic() - start_time
+                self._metrics.record_migration(source_node, "multi_target", duration, False)
+                logger.error("Drain %s failed: %s", migration_id, e)
+                self._meta.save_migration_state(migration_id, {
+                    "migration_id": migration_id,
+                    "source_node": source_node,
+                    "status": "failed",
+                    "error": str(e),
+                })
+            finally:
+                async with self._migration_lock:
+                    self._active_migrations.pop(migration_id, None)
+
+    async def _wait_active_migrations_for_node(
+        self, node_id: str, primary_migration_id: Optional[str] = None
+    ) -> None:
+        deadline = time.monotonic() + 120.0
         while time.monotonic() < deadline:
-            pending = False
             async with self._migration_lock:
+                done = True
+                if primary_migration_id and primary_migration_id in self._active_migrations:
+                    if not self._active_migrations[primary_migration_id].done():
+                        done = False
                 for mid, task in list(self._active_migrations.items()):
                     if not task.done():
-                        pending = True
+                        done = False
                         break
-            if not pending:
+            if done:
                 return
             await asyncio.sleep(0.1)
 
@@ -229,20 +273,45 @@ class NodeManager:
     def _all_responsible_nodes(self, key: str) -> List[str]:
         return self.get_nodes_for_key(key)
 
+    async def _record_read_fault_if_needed(self, primary_node: str, took_over: bool) -> None:
+        if not took_over:
+            return
+        async with self._fault_lock:
+            if primary_node in self._fault_recorded:
+                return
+            self._fault_recorded.add(primary_node)
+        try:
+            await self._fault.handle_node_failure(
+                primary_node, "Primary offline during GET, replica took over"
+            )
+            self._metrics.record_fault(primary_node, "replica_takeover")
+            logger.warning(
+                "Recorded fault for node %s due to replica takeover during read",
+                primary_node,
+            )
+        except Exception as e:
+            logger.error("Error recording read fault for %s: %s", primary_node, e)
+
     async def read_key(self, node_id: str, key: str) -> Optional[Any]:
-        primary_nodes = self._all_responsible_nodes(key)
+        responsible_nodes = self._all_responsible_nodes(key)
         tried = set()
         result: Optional[Any] = None
         hit_recorded = False
+        primary_node = responsible_nodes[0] if responsible_nodes else node_id
+        primary_was_offline = False
 
-        for candidate in primary_nodes:
+        for candidate in responsible_nodes:
             if candidate in tried:
                 continue
             tried.add(candidate)
             node_info = self._ring.get_all_nodes().get(candidate)
             if node_info is None:
+                if candidate == primary_node:
+                    primary_was_offline = True
                 continue
             if not node_info.is_online and candidate not in self._draining_nodes:
+                if candidate == primary_node:
+                    primary_was_offline = True
                 continue
 
             async with self._data_lock:
@@ -275,6 +344,17 @@ class NodeManager:
                     hit_recorded = True
                 return cached
 
+        took_over = (primary_was_offline and result is not None and primary_node not in tried) \
+            or (primary_was_offline and result is not None)
+
+        if primary_was_offline and result is not None and not hit_recorded:
+            took_over = True
+        elif primary_was_offline and result is not None:
+            took_over = True
+
+        if primary_was_offline and result is not None:
+            await self._record_read_fault_if_needed(primary_node, took_over)
+
         if result is None and not hit_recorded:
             self._metrics.record_miss(node_id if node_id else "unknown")
 
@@ -286,7 +366,9 @@ class NodeManager:
 
         for target in all_nodes:
             node_info = self._ring.get_all_nodes().get(target)
-            if node_info is None or not node_info.is_online:
+            if node_info is None:
+                continue
+            if not node_info.is_online and target not in self._draining_nodes:
                 continue
             try:
                 async with self._data_lock:
@@ -366,21 +448,21 @@ class NodeManager:
                 )
 
                 async with self._data_lock:
-                    source_keys = list(self._shard_data.get(plan.source_node, {}).keys())
-                keys_to_migrate = []
-                for key in source_keys:
-                    if self._ring.get_node(key) == plan.target_node:
-                        keys_to_migrate.append(key)
+                    source_items = list(self._shard_data.get(plan.source_node, {}).items())
+
+                keys_to_move = []
+                for key, value in source_items:
+                    real_target = self._ring.get_node(key)
+                    if real_target == plan.target_node:
+                        keys_to_move.append((key, value))
 
                 batch_size = 100
                 moved = 0
-                for i in range(0, len(keys_to_migrate), batch_size):
-                    batch = keys_to_migrate[i : i + batch_size]
+                for i in range(0, len(keys_to_move), batch_size):
+                    batch = keys_to_move[i : i + batch_size]
                     async with self._data_lock:
-                        for key in batch:
-                            value = self._shard_data[plan.source_node].get(key)
-                            if value is not None:
-                                self._shard_data[plan.target_node][key] = value
+                        for key, value in batch:
+                            self._shard_data[plan.target_node][key] = value
                     moved += len(batch)
                     await asyncio.sleep(0)
 
@@ -399,7 +481,7 @@ class NodeManager:
                 )
                 logger.info(
                     "Migration %s completed in %.3fs, %d/%d keys migrated",
-                    migration_id, duration, moved, len(keys_to_migrate),
+                    migration_id, duration, moved, len(keys_to_move),
                 )
 
             except Exception as e:

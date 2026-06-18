@@ -194,11 +194,35 @@ def test_resilience_layer():
         log("  RetryExecutor OK")
 
         ig = IdempotencyGuard()
-        cached = await ig.check_and_mark("req1")
-        assert cached is None
-        await ig.record_result("req1", {"data": 42})
-        cached2 = await ig.check_and_mark("req1")
-        assert cached2 == {"data": 42}
+
+        log("  IdempotencyGuard scenario 1: first request (READY)")
+        state = await ig.check_and_mark("req_first")
+        assert state is IdempotencyGuard.READY, f"Expected READY, got {state!r}"
+        await ig.record_result("req_first", {"data": 42})
+
+        log("  IdempotencyGuard scenario 2: completed duplicate -> cached result")
+        cached = await ig.check_and_mark("req_first")
+        assert cached == {"data": 42}, f"Expected cached result, got {cached!r}"
+
+        log("  IdempotencyGuard scenario 3: concurrent duplicate (PENDING)")
+        state2 = await ig.check_and_mark("req_concurrent")
+        assert state2 is IdempotencyGuard.READY
+
+        async def slow_writer():
+            await asyncio.sleep(0.05)
+            await ig.record_result("req_concurrent", {"data": 7})
+
+        async def waiter():
+            state3 = await ig.check_and_mark("req_concurrent")
+            if state3 is IdempotencyGuard.PENDING:
+                return await ig.wait_for_result("req_concurrent")
+            return state3
+
+        writer_task = asyncio.create_task(slow_writer())
+        waiter_task = asyncio.create_task(waiter())
+        _, waiter_result = await asyncio.gather(writer_task, waiter_task)
+        assert waiter_result == {"data": 7}, f"Expected waiter to get {{'data': 7}}, got {waiter_result!r}"
+
         log("  IdempotencyGuard OK")
 
         log("  RESILIENCE LAYER OK")
@@ -248,8 +272,41 @@ def test_node_manager():
             assert status["total_nodes"] == 3
             log(f"  Cluster status: {status}")
 
+            written = {}
+            for i in range(50):
+                k = f"drain_k_{i}"
+                v = f"drain_v_{i}"
+                n = nm.get_node(k)
+                await nm.write_key(n, k, v)
+                written[k] = v
+
             await nm.remove_node("n2")
-            assert nm.get_cluster_status()["total_nodes"] == 2
+            status_after_remove = nm.get_cluster_status()
+            log(f"  After remove_node API returned: draining={status_after_remove['draining_nodes']} total_nodes={status_after_remove['total_nodes']}")
+            assert "n2" in status_after_remove["draining_nodes"] or status_after_remove["total_nodes"] <= 3
+
+            miss_immediate = 0
+            for k, v in written.items():
+                n = nm.get_node(k)
+                got = await nm.read_key(n, k)
+                if got != v:
+                    miss_immediate += 1
+            log(f"  Immediate reads after remove_node: {miss_immediate}/{len(written)} misses")
+            assert miss_immediate == 0, f"Data lost immediately after remove_node: {miss_immediate} misses"
+
+            await asyncio.sleep(0.5)
+            final_status = nm.get_cluster_status()
+            log(f"  After drain settled: total_nodes={final_status['total_nodes']} draining={final_status['draining_nodes']}")
+            assert final_status["total_nodes"] == 2, f"Expected 2 nodes after full removal, got {final_status['total_nodes']}"
+
+            miss_final = 0
+            for k, v in written.items():
+                n = nm.get_node(k)
+                got = await nm.read_key(n, k)
+                if got != v:
+                    miss_final += 1
+            log(f"  Reads after drain complete: {miss_final}/{len(written)} misses")
+            assert miss_final == 0, f"Data lost after drain finished: {miss_final} misses"
 
             await nm.stop()
             meta.close()
