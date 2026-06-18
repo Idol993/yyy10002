@@ -168,28 +168,70 @@ class RetryExecutor:
 
 class IdempotencyGuard:
 
+    PENDING = "__pending_sentinel__"
+    READY = "__ready_sentinel__"
+
     def __init__(self, ttl_seconds: float = 300.0, max_entries: int = 10000):
         self._ttl = ttl_seconds
         self._max_entries = max_entries
         self._store: Dict[str, tuple] = {}
+        self._events: Dict[str, asyncio.Event] = {}
         self._lock = asyncio.Lock()
 
-    async def check_and_mark(self, request_id: str) -> Optional[Any]:
+    async def check_and_mark(self, request_id: str):
         async with self._lock:
             if request_id in self._store:
                 result, ts = self._store[request_id]
                 if time.monotonic() - ts < self._ttl:
-                    logger.debug("Idempotent hit for request %s", request_id)
+                    if result is self.PENDING:
+                        return self.PENDING
                     return result
                 del self._store[request_id]
+                self._events.pop(request_id, None)
 
-            self._store[request_id] = (None, time.monotonic())
+            self._store[request_id] = (self.PENDING, time.monotonic())
+            self._events[request_id] = asyncio.Event()
             self._cleanup()
+            return self.READY
+
+    async def wait_for_result(self, request_id: str, timeout: float = 30.0):
+        event = None
+        async with self._lock:
+            event = self._events.get(request_id)
+            if event is None:
+                if request_id in self._store:
+                    result, _ = self._store[request_id]
+                    if result is not self.PENDING:
+                        return result
+                return None
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Idempotency wait timed out for request %s", request_id)
             return None
 
-    async def record_result(self, request_id: str, result: Any) -> None:
+        async with self._lock:
+            if request_id in self._store:
+                result, _ = self._store[request_id]
+                if result is not self.PENDING:
+                    return result
+            return None
+
+    async def record_result(self, request_id: str, result) -> None:
         async with self._lock:
             self._store[request_id] = (result, time.monotonic())
+            event = self._events.get(request_id)
+            if event is not None:
+                event.set()
+                del self._events[request_id]
+
+    async def clear(self, request_id: str) -> None:
+        async with self._lock:
+            self._store.pop(request_id, None)
+            event = self._events.pop(request_id, None)
+            if event is not None:
+                event.set()
 
     def _cleanup(self) -> None:
         if len(self._store) > self._max_entries:
@@ -197,9 +239,11 @@ class IdempotencyGuard:
             expired = [k for k, (_, ts) in self._store.items() if ts < cutoff]
             for k in expired:
                 del self._store[k]
+                self._events.pop(k, None)
             if len(self._store) > self._max_entries:
                 sorted_keys = sorted(
                     self._store.keys(), key=lambda k: self._store[k][1]
                 )
                 for k in sorted_keys[: len(self._store) - self._max_entries]:
                     del self._store[k]
+                    self._events.pop(k, None)

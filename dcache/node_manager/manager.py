@@ -3,6 +3,7 @@ import logging
 import time
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 
 from ..algorithm.consistent_hash import (
@@ -17,6 +18,17 @@ from ..fault_tolerance.manager import FaultToleranceManager
 from ..monitor.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
+
+
+_MISS_SENTINEL = object()
+
+
+@dataclass
+class _IdempotentState:
+    pass
+
+
+_PENDING = _IdempotentState()
 
 
 class NodeManager:
@@ -52,6 +64,10 @@ class NodeManager:
         self._running = False
 
         self._shard_data: Dict[str, Dict[str, Any]] = defaultdict(dict)
+
+        self._draining_nodes: Set[str] = set()
+        self._migration_inflight_keys: Set[str] = set()
+        self._data_lock = asyncio.Lock()
 
     async def start(self) -> None:
         self._running = True
@@ -123,38 +139,82 @@ class NodeManager:
         return node_info
 
     async def remove_node(self, node_id: str) -> None:
-        try:
-            migration_plans = self._ring.remove_node(node_id)
-        except NodeNotFoundError:
-            logger.warning("Attempted to remove unknown node: %s", node_id)
-            raise
+        logger.info("Safe remove of node %s starting", node_id)
 
-        self._node_heartbeats.pop(node_id, None)
-        self._meta.delete_node_info(node_id)
-        self._persist_topology()
+        if node_id not in self._ring.get_all_nodes():
+            raise NodeNotFoundError(f"Node {node_id} not found")
 
-        if migration_plans:
-            for plan in migration_plans:
-                await self._start_migration(plan)
-
-        self._update_cluster_metrics()
-        logger.info(
-            "Node %s removed, %d migrations", node_id, len(migration_plans)
-        )
-
-    async def graceful_remove_node(self, node_id: str) -> None:
-        logger.info("Graceful removal of node %s", node_id)
+        self._draining_nodes.add(node_id)
         self._ring.set_node_offline(node_id)
 
-        migration_plans = self._ring.compute_rebalance_plan(
-            skew_threshold=0.01
-        )
+        migration_plans = []
+        all_nodes_info = self._ring.get_all_nodes()
+        all_node_ids = list(all_nodes_info.keys())
+        if len(all_node_ids) > 1:
+            remaining = [nid for nid in all_node_ids if nid != node_id]
+            remaining_online = [n for n in remaining if all_nodes_info[n].is_online]
+            if remaining_online:
+                source_data = list(self._shard_data.get(node_id, {}).keys())
+                total_keys = len(source_data)
+                if total_keys > 0:
+                    batch = MigrationPlan(
+                        source_node=node_id,
+                        target_node=remaining_online[0],
+                        key_ranges=[],
+                        estimated_keys=total_keys,
+                    )
+                    migration_plans.append(batch)
 
-        node_plans = [p for p in migration_plans if p.source_node == node_id]
-        for plan in node_plans:
-            await self._start_migration(plan)
+        try:
+            if migration_plans:
+                for plan in migration_plans:
+                    await self._start_migration(plan)
 
-        await asyncio.sleep(0.1)
+            self._node_heartbeats.pop(node_id, None)
+            self._meta.delete_node_info(node_id)
+
+            self._persist_topology()
+            self._update_cluster_metrics()
+
+            logger.info(
+                "Node %s drain started, %d migrations, API returning ok (data drain in background)",
+                node_id, len(migration_plans),
+            )
+        except Exception as e:
+            logger.error("Error during remove_node: %s", e)
+            raise
+
+        async def _finalize_removal():
+            try:
+                await asyncio.sleep(0)
+                await self._wait_active_migrations_for_node(node_id)
+                try:
+                    self._ring.remove_node(node_id)
+                except NodeNotFoundError:
+                    pass
+                self._draining_nodes.discard(node_id)
+                self._shard_data.pop(node_id, None)
+                self._persist_topology()
+                logger.info("Node %s fully removed after drain complete", node_id)
+            except Exception as e:
+                logger.error("Error finalizing removal of %s: %s", node_id, e)
+
+        asyncio.create_task(_finalize_removal())
+
+    async def _wait_active_migrations_for_node(self, node_id: str) -> None:
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            pending = False
+            async with self._migration_lock:
+                for mid, task in list(self._active_migrations.items()):
+                    if not task.done():
+                        pending = True
+                        break
+            if not pending:
+                return
+            await asyncio.sleep(0.1)
+
+    async def graceful_remove_node(self, node_id: str) -> None:
         await self.remove_node(node_id)
 
     def update_heartbeat(self, node_id: str) -> None:
@@ -166,58 +226,108 @@ class NodeManager:
     def get_nodes_for_key(self, key: str) -> List[str]:
         return self._ring.get_nodes_for_key(key)
 
-    async def read_key(self, node_id: str, key: str) -> Optional[Any]:
-        node = self._ring.get_all_nodes().get(node_id)
-        if node is None or not node.is_online:
-            return await self._fault.read_with_fallback(
-                key, node_id, self._remote_read
-            )
+    def _all_responsible_nodes(self, key: str) -> List[str]:
+        return self.get_nodes_for_key(key)
 
-        try:
-            data = self._shard_data.get(node_id, {}).get(key)
-            if data is not None:
-                self._metrics.record_hit(node_id)
-                return data
-            self._metrics.record_miss(node_id)
-            return None
-        except Exception as e:
-            logger.warning("Read failed on node %s for key %s: %s", node_id, key, e)
-            return await self._fault.read_with_fallback(
-                key, node_id, self._remote_read
-            )
+    async def read_key(self, node_id: str, key: str) -> Optional[Any]:
+        primary_nodes = self._all_responsible_nodes(key)
+        tried = set()
+        result: Optional[Any] = None
+        hit_recorded = False
+
+        for candidate in primary_nodes:
+            if candidate in tried:
+                continue
+            tried.add(candidate)
+            node_info = self._ring.get_all_nodes().get(candidate)
+            if node_info is None:
+                continue
+            if not node_info.is_online and candidate not in self._draining_nodes:
+                continue
+
+            async with self._data_lock:
+                data = self._shard_data.get(candidate, {})
+                value = data.get(key, _MISS_SENTINEL)
+            if value is not _MISS_SENTINEL:
+                if not hit_recorded:
+                    self._metrics.record_hit(candidate)
+                    hit_recorded = True
+                result = value
+                break
+
+        if result is None:
+            for drain_node in list(self._draining_nodes):
+                async with self._data_lock:
+                    drain_data = self._shard_data.get(drain_node, {})
+                    value = drain_data.get(key, _MISS_SENTINEL)
+                if value is not _MISS_SENTINEL:
+                    if not hit_recorded:
+                        self._metrics.record_hit(drain_node)
+                        hit_recorded = True
+                    result = value
+                    break
+
+        if result is None:
+            cached = await self._fault.local_cache.get(key)
+            if cached is not None:
+                if not hit_recorded:
+                    self._metrics.record_hit("local_cache")
+                    hit_recorded = True
+                return cached
+
+        if result is None and not hit_recorded:
+            self._metrics.record_miss(node_id if node_id else "unknown")
+
+        return result
 
     async def write_key(self, node_id: str, key: str, value: Any) -> bool:
-        node = self._ring.get_all_nodes().get(node_id)
-        if node is None or not node.is_online:
-            return await self._fault.write_with_fallback(
-                key, value, node_id, self._remote_write
-            )
+        all_nodes = self._all_responsible_nodes(key)
+        success_count = 0
+
+        for target in all_nodes:
+            node_info = self._ring.get_all_nodes().get(target)
+            if node_info is None or not node_info.is_online:
+                continue
+            try:
+                async with self._data_lock:
+                    self._shard_data[target][key] = value
+                success_count += 1
+            except Exception as e:
+                logger.warning("Write to replica %s for key %s failed: %s", target, key, e)
+
+        await self._fault.local_cache.put(key, value)
+
+        if success_count > 0:
+            return True
 
         try:
-            self._shard_data[node_id][key] = value
+            async with self._data_lock:
+                if node_id in self._ring.get_all_nodes():
+                    self._shard_data[node_id][key] = value
+                else:
+                    if all_nodes:
+                        self._shard_data[all_nodes[0]][key] = value
             return True
         except Exception as e:
-            logger.warning("Write failed on node %s for key %s: %s", node_id, key, e)
-            return await self._fault.write_with_fallback(
-                key, value, node_id, self._remote_write
-            )
-
-    async def delete_key(self, node_id: str, key: str) -> bool:
-        try:
-            data = self._shard_data.get(node_id, {})
-            if key in data:
-                del data[key]
-            return True
-        except Exception as e:
-            logger.error("Delete failed on node %s for key %s: %s", node_id, key, e)
+            logger.error("All writes failed for key %s: %s", key, e)
             return False
 
+    async def delete_key(self, node_id: str, key: str) -> bool:
+        all_nodes = self._all_responsible_nodes(key)
+        for target in all_nodes:
+            async with self._data_lock:
+                data = self._shard_data.get(target, {})
+                data.pop(key, None)
+        await self._fault.local_cache.delete(key)
+        return True
+
     async def _remote_read(self, node_id: str, key: str) -> Optional[Any]:
-        data = self._shard_data.get(node_id, {}).get(key)
-        return data
+        async with self._data_lock:
+            return self._shard_data.get(node_id, {}).get(key)
 
     async def _remote_write(self, node_id: str, key: str, value: Any) -> bool:
-        self._shard_data[node_id][key] = value
+        async with self._data_lock:
+            self._shard_data[node_id][key] = value
         return True
 
     async def _start_migration(self, plan: MigrationPlan) -> str:
@@ -255,19 +365,23 @@ class NodeManager:
                     migration_id, plan.source_node, plan.target_node,
                 )
 
-                source_data = self._shard_data.get(plan.source_node, {})
-                keys_to_migrate = list(source_data.keys())
+                async with self._data_lock:
+                    source_keys = list(self._shard_data.get(plan.source_node, {}).keys())
+                keys_to_migrate = []
+                for key in source_keys:
+                    if self._ring.get_node(key) == plan.target_node:
+                        keys_to_migrate.append(key)
 
                 batch_size = 100
+                moved = 0
                 for i in range(0, len(keys_to_migrate), batch_size):
                     batch = keys_to_migrate[i : i + batch_size]
-                    for key in batch:
-                        assigned_node = self._ring.get_node(key)
-                        if assigned_node == plan.target_node:
-                            value = source_data.get(key)
+                    async with self._data_lock:
+                        for key in batch:
+                            value = self._shard_data[plan.source_node].get(key)
                             if value is not None:
                                 self._shard_data[plan.target_node][key] = value
-
+                    moved += len(batch)
                     await asyncio.sleep(0)
 
                 self._meta.save_migration_state(migration_id, {
@@ -276,6 +390,7 @@ class NodeManager:
                     "target_node": plan.target_node,
                     "status": "completed",
                     "completed_at": time.time(),
+                    "moved_keys": moved,
                 })
 
                 duration = time.monotonic() - start_time
@@ -283,8 +398,8 @@ class NodeManager:
                     plan.source_node, plan.target_node, duration, True
                 )
                 logger.info(
-                    "Migration %s completed in %.3fs, %d keys processed",
-                    migration_id, duration, len(keys_to_migrate),
+                    "Migration %s completed in %.3fs, %d/%d keys migrated",
+                    migration_id, duration, moved, len(keys_to_migrate),
                 )
 
             except Exception as e:
@@ -334,6 +449,8 @@ class NodeManager:
                 now = time.monotonic()
                 for node_id, last_hb in list(self._node_heartbeats.items()):
                     if now - last_hb > self._heartbeat_timeout:
+                        if node_id in self._draining_nodes:
+                            continue
                         logger.warning(
                             "Node %s heartbeat timeout (%.1fs), marking offline",
                             node_id, now - last_hb,
@@ -425,5 +542,6 @@ class NodeManager:
             "vnode_count": self._ring.get_vnode_count(),
             "replication_factor": self._ring.get_replication_factor(),
             "active_migrations": len(self._active_migrations),
+            "draining_nodes": list(self._draining_nodes),
             "load_distribution": distribution,
         }

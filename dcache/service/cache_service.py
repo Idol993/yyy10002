@@ -68,14 +68,12 @@ class CacheService:
                 )
 
                 await self._circuit_breaker.record_success()
-                self._metrics.record_hit(node_id)
 
                 if result is not None:
                     return web.json_response(
                         {"key": key, "value": result, "node": node_id}
                     )
                 else:
-                    self._metrics.record_miss(node_id)
                     return web.json_response(
                         {"key": key, "value": None, "node": node_id}, status=404
                     )
@@ -91,16 +89,25 @@ class CacheService:
 
         request_id = request.headers.get("X-Request-Id", "")
         if request_id:
-            cached_result = await self._idempotency.check_and_mark(request_id)
-            if cached_result is not None:
-                return web.json_response(cached_result)
+            guard_result = await self._idempotency.check_and_mark(request_id)
+            if guard_result is IdempotencyGuard.READY:
+                pass
+            elif guard_result is IdempotencyGuard.PENDING:
+                result = await self._idempotency.wait_for_result(request_id)
+                return web.json_response(result)
+            else:
+                return web.json_response(guard_result)
 
         if not await self._rate_limiter.allow("put"):
             self._metrics.record_request("PUT", "/cache", 0, "rate_limited")
+            if request_id:
+                await self._idempotency.clear(request_id)
             return web.json_response({"error": "rate limited"}, status=429)
 
         if not await self._circuit_breaker.allow_request():
             self._metrics.record_request("PUT", "/cache", 0, "circuit_open")
+            if request_id:
+                await self._idempotency.clear(request_id)
             return web.json_response({"error": "circuit breaker open"}, status=503)
 
         async with RequestTimer(self._metrics, "PUT", "/cache"):
@@ -110,6 +117,8 @@ class CacheService:
 
                 node_id = self._get_node_fn(key)
                 if node_id is None:
+                    if request_id:
+                        await self._idempotency.clear(request_id)
                     return web.json_response(
                         {"error": "no available node"}, status=503
                     )
@@ -131,6 +140,8 @@ class CacheService:
                 return web.json_response(response_data)
             except Exception as e:
                 await self._circuit_breaker.record_failure()
+                if request_id:
+                    await self._idempotency.clear(request_id)
                 logger.error("PUT key=%s failed: %s", key, e)
                 return web.json_response({"error": str(e)}, status=500)
 
