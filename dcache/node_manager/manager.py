@@ -185,18 +185,23 @@ class NodeManager:
                 async with self._data_lock:
                     source_items = list(self._shard_data.get(source_node, {}).items())
 
+                online_nodes = self._ring.get_online_nodes()
+                online_node_ids = [nid for nid in online_nodes.keys() if nid != source_node]
+
                 per_target: Dict[str, List[tuple]] = defaultdict(list)
+                unmigrated = 0
                 for key, value in source_items:
-                    target = self._ring.get_node(key)
-                    if target is None or target == source_node:
-                        remaining = [
-                            nid for nid, n in self._ring.get_online_nodes().items()
-                            if nid != source_node
-                        ]
-                        if remaining:
-                            target = remaining[0]
-                        else:
-                            continue
+                    target = None
+                    replica_chain = self._ring.get_nodes_for_key(key)
+                    for candidate in replica_chain:
+                        if candidate != source_node and candidate in online_node_ids:
+                            target = candidate
+                            break
+                    if target is None and online_node_ids:
+                        target = online_node_ids[0]
+                    if target is None:
+                        unmigrated += 1
+                        continue
                     per_target[target].append((key, value))
 
                 total_moved = 0
@@ -220,10 +225,11 @@ class NodeManager:
                     "status": "completed",
                     "completed_at": time.time(),
                     "moved_keys": total_moved,
+                    "unmigrated_keys": unmigrated,
                 })
                 logger.info(
-                    "Drain %s completed in %.3fs, %d keys across %d targets",
-                    migration_id, duration, total_moved, len(per_target),
+                    "Drain %s completed in %.3fs, %d keys across %d targets, %d unmigrated",
+                    migration_id, duration, total_moved, len(per_target), unmigrated,
                 )
             except Exception as e:
                 success = False
@@ -260,6 +266,19 @@ class NodeManager:
 
     async def graceful_remove_node(self, node_id: str) -> None:
         await self.remove_node(node_id)
+
+    async def inject_node_data(self, node_id: str, key: str, value: Any) -> None:
+        """Test helper: write data only to a specific node's local store, bypassing replica writes and local cache."""
+        async with self._data_lock:
+            if node_id not in self._shard_data:
+                self._shard_data[node_id] = {}
+            self._shard_data[node_id][key] = value
+        logger.debug("Injected key=%s into node=%s local only", key, node_id)
+
+    async def get_node_data_keys(self, node_id: str) -> List[str]:
+        """Test helper: list all keys stored on a specific node."""
+        async with self._data_lock:
+            return list(self._shard_data.get(node_id, {}).keys())
 
     def update_heartbeat(self, node_id: str) -> None:
         self._node_heartbeats[node_id] = time.monotonic()

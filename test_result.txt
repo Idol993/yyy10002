@@ -1,0 +1,42 @@
+============================================================
+VERIFICATION TESTS
+============================================================
+
+[TEST] Algorithm Layer
+  test_key -> n3
+  Replicas: ['n3', 'n2']
+  Load distribution: {'n1': 0.17716322978958488, 'n2': 0.29880485497415066, 'n3': 0.5240319152362645}
+  After removing n2: 2 nodes, 82 migration plans
+  ALGORITHM LAYER OK
+
+[TEST] Persistence Layer
+  PERSISTENCE LAYER OK
+
+[TEST] Fault Tolerance Layer
+  FAULT TOLERANCE LAYER OK
+
+[TEST] Monitoring Layer
+  MONITORING LAYER OK
+
+[TEST] Resilience Layer
+  CircuitBreaker OK
+  RateLimiter OK
+  RetryExecutor OK
+  IdempotencyGuard scenario 1: first request (READY)
+  IdempotencyGuard scenario 2: completed duplicate -> cached result
+  IdempotencyGuard scenario 3: concurrent duplicate (PENDING)
+  IdempotencyGuard OK
+  RESILIENCE LAYER OK
+
+[TEST] Node Manager
+  Cluster status: {'total_nodes': 3, 'online_nodes': 3, 'vnode_count': 300, 'replication_factor': 2, 'active_migrations': 152, 'draining_nodes': [], 'load_distribution': {'n1': 0.33667667116969824, 'n2': 0.1202317294664681, 'n3': 0.5430915993638337}}
+  Immediate reads after remove_node: 0/50 misses
+  After drain settled: total_nodes=2 draining=[]
+  Reads after drain complete: 0/50 misses
+  Source-only keys final target distribution: {'n3': 65, 'n1': 35}
+  Source-only keys read after node gone: 0/100 misses
+  NODE MANAGER OK
+
+============================================================
+Results: 6 passed, 0 failed
+============================================================

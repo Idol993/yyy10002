@@ -4,6 +4,7 @@ import os
 import random
 import tempfile
 import time
+from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -330,21 +331,8 @@ async def test_http_churn_data_integrity():
         )
         await server.start()
 
-        actual_port = None
-        for site in getattr(server._runner, "sites", []) or []:
-            name = getattr(site, "_name", None) or ""
-            try:
-                actual_port = int(str(name).split(":")[-1])
-            except Exception:
-                pass
-        if actual_port is None or actual_port == 0:
-            runner_sites = server._runner.sites
-            if runner_sites:
-                s = runner_sites[0]
-                try:
-                    actual_port = int(str(getattr(s, "_server", s).sockets[0].getsockname()[1]))
-                except Exception:
-                    pass
+        actual_port = server.actual_port
+        assert actual_port and actual_port != 0, "Failed to get actual listening port"
         base_url = f"http://127.0.0.1:{actual_port}"
         log(f"  Server listening on {base_url}")
 
@@ -498,6 +486,122 @@ async def test_http_churn_data_integrity():
         log("TEST 6 PASSED")
 
 
+async def test_drain_source_only_data():
+    log("\n=== TEST 7: Drain Source-Only Data + /cluster/status Confirmation ===")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ring = ConsistentHashRing(vnodes_per_weight=50, replication_factor=2)
+        meta = MetadataStore(db_path=os.path.join(tmpdir, "db"))
+        meta.open()
+        metrics = MetricsCollector()
+        ft = FaultToleranceManager(get_replicas_fn=ring.get_nodes_for_key)
+
+        nm = NodeManager(
+            hash_ring=ring, meta_store=meta, fault_manager=ft,
+            metrics=metrics, migration_concurrency=4,
+            rebalance_interval=3600, skew_threshold=0.5,
+        )
+        await nm.start()
+
+        await nm.add_node({"node_id": "n1", "host": "h1", "port": 8001, "weight": 1})
+        await nm.add_node({"node_id": "n2", "host": "h2", "port": 8002, "weight": 1})
+        await nm.add_node({"node_id": "n3", "host": "h3", "port": 8003, "weight": 1})
+        await nm.add_node({"node_id": "n4", "host": "h4", "port": 8004, "weight": 1})
+
+        source_node = "n2"
+
+        source_only_data = {}
+        target_count = defaultdict(int)
+        for i in range(200):
+            key = f"src_only_{i}"
+            value = f"src_only_v_{i}"
+            await nm.inject_node_data(source_node, key, value)
+
+            new_primary_after_removal = None
+            for candidate in ring.get_nodes_for_key(key):
+                if candidate != source_node:
+                    new_primary_after_removal = candidate
+                    break
+            target_count[new_primary_after_removal] += 1
+            source_only_data[key] = (value, new_primary_after_removal)
+
+        log(f"  Injected {len(source_only_data)} keys only into {source_node}")
+        log(f"  Expected new target distribution after removal: {dict(target_count)}")
+        assert len(target_count) >= 2, (
+            f"Keys should distribute to >= 2 targets after removal, got {len(target_count)}"
+        )
+
+        n2_keys_before = await nm.get_node_data_keys(source_node)
+        assert len(n2_keys_before) == len(source_only_data), (
+            f"Source node should have exactly {len(source_only_data)} keys, got {len(n2_keys_before)}"
+        )
+
+        for other_node in ["n1", "n3", "n4"]:
+            other_keys = await nm.get_node_data_keys(other_node)
+            assert len(other_keys) == 0, (
+                f"Node {other_node} should have 0 source-only keys, got {len(other_keys)}"
+            )
+
+        local_cache_hits = 0
+        for key in source_only_data:
+            if await ft.local_cache.get(key) is not None:
+                local_cache_hits += 1
+        assert local_cache_hits == 0, (
+            f"Local cache should have 0 source-only keys, got {local_cache_hits}"
+        )
+
+        status_before = nm.get_cluster_status()
+        log(f"  Before remove: total_nodes={status_before['total_nodes']}")
+        assert source_node in status_before["load_distribution"]
+
+        await nm.remove_node(source_node)
+
+        deadline = time.monotonic() + 10.0
+        node_gone = False
+        while time.monotonic() < deadline and not node_gone:
+            status = nm.get_cluster_status()
+            if (source_node not in status["load_distribution"]
+                    and source_node not in status["draining_nodes"]
+                    and status["total_nodes"] == 3):
+                node_gone = True
+                break
+            await asyncio.sleep(0.05)
+
+        status_after = nm.get_cluster_status()
+        log(f"  After drain: total_nodes={status_after['total_nodes']} draining={status_after['draining_nodes']}")
+        assert node_gone, (
+            f"Node {source_node} still present in cluster status after 10s"
+        )
+        assert source_node not in status_after["load_distribution"]
+
+        misses = 0
+        wrong_target = 0
+        target_verification = defaultdict(int)
+        for key, (expected_value, expected_target) in source_only_data.items():
+            primary = nm.get_node(key)
+            assert primary != source_node, (
+                f"Primary should not be removed node {source_node} for key {key}"
+            )
+            result = await nm.read_key(primary, key)
+            if result != expected_value:
+                misses += 1
+                if misses <= 5:
+                    log(f"  MISS key={key} got={result!r} expected={expected_value!r}")
+            target_verification[primary] += 1
+            if primary != expected_target:
+                wrong_target += 1
+
+        log(f"  Final target distribution: {dict(target_verification)}")
+        log(f"  Drain verification: {misses}/{len(source_only_data)} misses, {wrong_target} wrong targets")
+        assert misses == 0, f"Data lost after drain: {misses} keys not found"
+        assert len(target_verification) >= 2, (
+            f"Keys should be distributed to >= 2 targets, got {len(target_verification)}"
+        )
+
+        await nm.stop()
+        meta.close()
+        log("TEST 7 PASSED")
+
+
 async def main():
     log("=" * 60)
     log("INTEGRATION TESTS FOR BUG FIXES")
@@ -510,6 +614,7 @@ async def main():
         test_hit_miss_metrics,
         test_idempotency_concurrent,
         test_http_churn_data_integrity,
+        test_drain_source_only_data,
     ]
 
     passed = 0

@@ -2,6 +2,7 @@ import asyncio
 import sys
 import os
 import time
+from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -280,10 +281,44 @@ def test_node_manager():
                 await nm.write_key(n, k, v)
                 written[k] = v
 
-            await nm.remove_node("n2")
-            status_after_remove = nm.get_cluster_status()
-            log(f"  After remove_node API returned: draining={status_after_remove['draining_nodes']} total_nodes={status_after_remove['total_nodes']}")
-            assert "n2" in status_after_remove["draining_nodes"] or status_after_remove["total_nodes"] <= 3
+            source_node = "n2"
+            source_only = {}
+            expected_targets = {}
+            for i in range(100):
+                k = f"src_only_{i}"
+                v = f"src_only_v_{i}"
+                await nm.inject_node_data(source_node, k, v)
+                new_primary = None
+                for candidate in ring.get_nodes_for_key(k):
+                    if candidate != source_node:
+                        new_primary = candidate
+                        break
+                expected_targets[k] = new_primary
+                source_only[k] = v
+
+            src_keys = await nm.get_node_data_keys(source_node)
+            assert len(src_keys) >= len(source_only), (
+                f"Source node should have at least {len(source_only)} keys"
+            )
+            for other in ["n1", "n3"]:
+                other_keys = await nm.get_node_data_keys(other)
+                for k in source_only:
+                    assert k not in other_keys, (
+                        f"Source-only key {k} should not be on node {other}"
+                    )
+
+            local_cache_hits = 0
+            for k in source_only:
+                if await ft.local_cache.get(k) is not None:
+                    local_cache_hits += 1
+            assert local_cache_hits == 0, (
+                f"Source-only keys should not be in local cache, got {local_cache_hits}"
+            )
+
+            status_before = nm.get_cluster_status()
+            assert source_node in status_before["load_distribution"]
+
+            await nm.remove_node(source_node)
 
             miss_immediate = 0
             for k, v in written.items():
@@ -294,10 +329,25 @@ def test_node_manager():
             log(f"  Immediate reads after remove_node: {miss_immediate}/{len(written)} misses")
             assert miss_immediate == 0, f"Data lost immediately after remove_node: {miss_immediate} misses"
 
-            await asyncio.sleep(0.5)
+            deadline = time.monotonic() + 10.0
+            node_gone = False
+            while time.monotonic() < deadline and not node_gone:
+                status = nm.get_cluster_status()
+                if (source_node not in status["load_distribution"]
+                        and source_node not in status["draining_nodes"]
+                        and status["total_nodes"] == 2):
+                    node_gone = True
+                    break
+                await asyncio.sleep(0.05)
+
             final_status = nm.get_cluster_status()
             log(f"  After drain settled: total_nodes={final_status['total_nodes']} draining={final_status['draining_nodes']}")
-            assert final_status["total_nodes"] == 2, f"Expected 2 nodes after full removal, got {final_status['total_nodes']}"
+            assert node_gone, (
+                f"Node {source_node} still present in cluster status after 10s"
+            )
+            assert final_status["total_nodes"] == 2
+            assert source_node not in final_status["load_distribution"]
+            assert source_node not in final_status["draining_nodes"]
 
             miss_final = 0
             for k, v in written.items():
@@ -307,6 +357,29 @@ def test_node_manager():
                     miss_final += 1
             log(f"  Reads after drain complete: {miss_final}/{len(written)} misses")
             assert miss_final == 0, f"Data lost after drain finished: {miss_final} misses"
+
+            source_only_misses = 0
+            target_distribution = defaultdict(int)
+            for k, v in source_only.items():
+                n = nm.get_node(k)
+                assert n != source_node, (
+                    f"Primary for {k} should not be removed node {source_node}"
+                )
+                got = await nm.read_key(n, k)
+                if got != v:
+                    source_only_misses += 1
+                    if source_only_misses <= 5:
+                        log(f"  SOURCE-ONLY MISS: key={k} got={got!r} expected={v!r}")
+                target_distribution[n] += 1
+
+            log(f"  Source-only keys final target distribution: {dict(target_distribution)}")
+            log(f"  Source-only keys read after node gone: {source_only_misses}/{len(source_only)} misses")
+            assert source_only_misses == 0, (
+                f"Source-only data lost after drain: {source_only_misses} keys missing"
+            )
+            assert len(target_distribution) >= 2, (
+                f"Source-only keys should be distributed to >= 2 targets, got {len(target_distribution)}"
+            )
 
             await nm.stop()
             meta.close()

@@ -114,7 +114,22 @@ class DistributedCacheServer:
         site = web.TCPSite(self._runner, self._host, self._port)
         await site.start()
 
-        logger.info("Server started on %s:%d", self._host, self._port)
+        self._actual_port = self._port
+        if self._port == 0:
+            for s in getattr(self._runner, "sites", []) or []:
+                try:
+                    server = getattr(s, "_server", None) or s
+                    if hasattr(server, "sockets") and server.sockets:
+                        self._actual_port = server.sockets[0].getsockname()[1]
+                        break
+                except Exception:
+                    pass
+
+        logger.info("Server started on %s:%d", self._host, self._actual_port)
+
+    @property
+    def actual_port(self) -> int:
+        return getattr(self, "_actual_port", self._port)
 
     async def stop(self) -> None:
         logger.info("Stopping DistributedCacheServer")

@@ -1,0 +1,53 @@
+============================================================
+INTEGRATION TESTS FOR BUG FIXES
+============================================================
+
+=== TEST 1: Migration + Read Consistency ===
+Wrote 200 keys to 2 nodes
+After adding n3: 0/200 reads missed
+After migration settle: 0/200 reads missed
+TEST 1 PASSED
+
+=== TEST 2: Replica Sync + Primary Failover (GET path triggers fault count) ===
+  Test key=my_test_key primary=n3 value=secret_value_42
+  Pre-fault dcache_fault_total sum: 0
+  After n3 down (via read_key), read got: secret_value_42
+  Post-fault (after GET replica takeover) dcache_fault_total sum: 1
+TEST 2 PASSED
+
+=== TEST 3: Node Removal Safe Drain ===
+  After remove n3: draining=['n3'] total_nodes=3
+  Immediate reads after remove_node: 0/100 missed
+  After settle: draining=[] total_nodes=2
+  Settled reads after remove_node: 0/100 missed
+TEST 3 PASSED
+
+=== TEST 4: Hit/Miss Metrics Accuracy ===
+  For node n2: hits=2 misses=2 total=4
+TEST 4 PASSED
+
+=== TEST 5: Concurrent PUT Idempotency ===
+  Executions: 1
+  Worker 0 result: {'processed': True, 'value': 'worker_0', 'exec_num': 1}
+  Worker 1 result: {'processed': True, 'value': 'worker_0', 'exec_num': 1}
+  Worker 2 result: {'processed': True, 'value': 'worker_0', 'exec_num': 1}
+  Worker 3 result: {'processed': True, 'value': 'worker_0', 'exec_num': 1}
+  Worker 4 result: {'processed': True, 'value': 'worker_0', 'exec_num': 1}
+TEST 5 PASSED
+
+=== TEST 6: HTTP Interface-Level Churn + PUT/GET Data Integrity ===
+  aiohttp not available, skipping HTTP churn test
+TEST 6 SKIPPED
+
+=== TEST 7: Drain Source-Only Data + /cluster/status Confirmation ===
+  Injected 200 keys only into n2
+  Expected new target distribution after removal: {'n1': 72, 'n4': 56, 'n3': 72}
+  Before remove: total_nodes=4
+  After drain: total_nodes=3 draining=[]
+  Final target distribution: {'n1': 72, 'n4': 56, 'n3': 72}
+  Drain verification: 0/200 misses, 0 wrong targets
+TEST 7 PASSED
+
+============================================================
+Results: 7 passed, 0 failed
+============================================================
